@@ -1,27 +1,45 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/CMAC420/chirpy.git/internal/database"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	db             *database.Queries
+	platform       string
 }
 
-type chirpRequest struct {
-	Body string `json:"body"`
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	UserID    uuid.UUID `json:"user_id"`
+	Body      string    `json:"body"`
 }
 
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-type validResponse struct {
-	Valid bool `json:"valid"`
+type createUserRequest struct {
+	Email string `json:"email"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -50,9 +68,44 @@ func (cfg *apiConfig) handlerAdminReset(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+
+	if cfg.platform != "dev" {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	err := cfg.db.DeleteAllUsers(r.Context())
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't reset database")
+		return
+	}
+
 	cfg.fileserverHits.Store(0)
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("Hits reset to 0"))
+	w.WriteHeader(http.StatusOK)
+}
+
+func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req createUserRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+
+	dbUser, err := cfg.db.CreateUser(r.Context(), req.Email)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create user")
+		return
+	}
+
+	user := databaseUserToUser(dbUser)
+
+	respondWithJSON(w, http.StatusCreated, user)
 }
 
 func readinessHandler(w http.ResponseWriter, r *http.Request) {
@@ -61,35 +114,117 @@ func readinessHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-func handlerValidateChirp(w http.ResponseWriter, r *http.Request) {
+func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
+	type createChirpRequest struct {
+		Body   string    `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
+	}
+
 	if r.Method != http.MethodPost {
-		w.WriteHeader((http.StatusMethodNotAllowed))
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	decoder := json.NewDecoder(r.Body)
-	var req chirpRequest
-	if err := decoder.Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		resp, _ := json.Marshal(errorResponse{Error: "Invalid JSON"})
-		w.Header().Set("Content-Type", "application:json")
-		w.Write(resp)
+
+	var req createChirpRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 	if len(req.Body) > 140 {
-		w.WriteHeader(http.StatusBadRequest)
-		resp, _ := json.Marshal(errorResponse{Error: "Chirp is too long"})
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(resp)
+		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	resp, _ := json.Marshal(validResponse{Valid: true})
+	cleaned := cleanChirp(req.Body)
+
+	dbChirp, err := cfg.db.CreateChirp(
+		r.Context(),
+		database.CreateChirpParams{
+			Body:   cleaned,
+			UserID: req.UserID,
+		},
+	)
+
+	if err != nil {
+		log.Println("CREATE CHIRP ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create chirp")
+		return
+	}
+
+	chirp := databaseChirpToChirp(dbChirp)
+	respondWithJSON(w, http.StatusCreated, chirp)
+}
+
+func respondWithError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	resp, _ := json.Marshal(map[string]string{
+		"error": msg,
+	})
 	w.Write(resp)
 }
 
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	resp, _ := json.Marshal(payload)
+	w.Write(resp)
+}
+
+func cleanChirp(body string) string {
+	badWords := map[string]bool{
+		"kerfuffle": true,
+		"sharbert":  true,
+		"fornax":    true,
+	}
+	words := strings.Split(body, " ")
+
+	for i, word := range words {
+		lowered := strings.ToLower(word)
+		if badWords[lowered] {
+			words[i] = "****"
+		}
+	}
+	return strings.Join(words, " ")
+}
+
+func databaseUserToUser(dbUser database.User) User {
+	return User{
+		ID:        dbUser.ID,
+		CreatedAt: dbUser.CreatedAt,
+		UpdatedAt: dbUser.UpdatedAt,
+		Email:     dbUser.Email,
+	}
+}
+
+func databaseChirpToChirp(dbChirp database.Chirp) Chirp {
+	return Chirp{
+		ID:        dbChirp.ID,
+		CreatedAt: dbChirp.CreatedAt,
+		UpdatedAt: dbChirp.UpdatedAt,
+		Body:      dbChirp.Body,
+		UserID:    dbChirp.UserID,
+	}
+}
+
 func main() {
-	apiCfg := &apiConfig{}
+
+	err := godotenv.Load()
+	if err != nil {
+		print("Error Loading environment")
+	}
+	platform := os.Getenv("PLATFORM")
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		print("error opening sql")
+	}
+	dbQueries := database.New(db)
+
+	apiCfg := &apiConfig{
+		db:       dbQueries,
+		platform: platform,
+	}
 	const filepathRoot = "."
 	const port = "8080"
 
@@ -98,7 +233,8 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", readinessHandler)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerAdminMetrics)
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerAdminReset)
-	mux.HandleFunc("POST /api/validate_chirp", handlerValidateChirp)
+	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
+	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
 
 	fileserver := http.FileServer(http.Dir(filepathRoot))
 
